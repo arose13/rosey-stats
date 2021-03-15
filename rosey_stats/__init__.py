@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 
 
-__version__ = '0.2020.03.07'
+__version__ = '1.2021.03.21'
 
 
 def solve_n_bins(x):

@@ -1,22 +1,163 @@
 import warnings
 import numpy as np
+import numpy.linalg as la
 import pandas as pd
-from sklearn.base import BaseEstimator, TransformerMixin
+from rich import print
+from tqdm import tqdm, trange
+from sklearn.utils import resample
+from sklearn.base import BaseEstimator, TransformerMixin, RegressorMixin
 from sklearn.decomposition import PCA
 from sklearn.linear_model import LogisticRegression, LinearRegression
 from sklearn.feature_selection import f_regression, f_classif
 from sklearn.exceptions import NotFittedError
 from sklearn.model_selection import KFold
 from sklearn.metrics import mean_squared_error, log_loss
-
-try:
-    from tqdm import tqdm
-except ImportError:
-    tqdm = False
+from glmnet import ElasticNet
 
 
 def vec_to_array(a: np.ndarray):
     return a.reshape((len(a), 1))
+
+
+# noinspection PyPep8Naming
+class Blooper(BaseEstimator, RegressorMixin):
+    """
+    Boostrap Lasso with Partial Ridge Regression
+    https://arxiv.org/pdf/1706.02150v1.pd
+    """
+    def __init__(
+            self,
+            n_lams: int = 50,
+            eps: float = 1e-3,
+            draws: int = 100,
+            cv: int = 10,
+            domain: str = None,
+            best_lam=None,
+            ridge_penalty=None,
+            fit_intercept=False,
+            verbose=False
+    ):
+        """
+        Boostrap Lasso with Partial Ridge Regression
+        https://arxiv.org/pdf/1706.02150v1.pdf
+
+        :param n_lams:
+        :param eps: The ratio between the max lambda and the min lambda
+        :param draws: Number of sample to draw form the posterior distribution
+        :param cv:
+        :param domain: {None, 'all', 'pos', 'neg'}
+        :param best_lam:
+        :param ridge_penalty: Only override if you know what you're doing
+        :param fit_intercept:
+        :param verbose:
+        """
+        self.n_lams = n_lams
+        self.eps = eps
+        self.draws = draws
+        self.cv = cv
+        self.domain = domain
+        self.best_lam_ = best_lam
+        self.ridge_penalty = ridge_penalty
+        self.fit_intercept = fit_intercept
+        self.verbose = verbose
+
+        self.coef_trace_ = None
+        self.intercept_trace_ = None
+        self.coef_mle_ = None
+        self.intercept_mle_ = None
+
+        if domain not in {None, 'all', 'pos', 'neg'}:
+            raise ValueError('`domain` must be one of the following None, "all", "pos", "neg"')
+
+    def fit(self, X: np.ndarray, y: np.ndarray):
+        # Do any preprocessing needed
+        X, y = X.astype(float), y.astype(float)
+        if self.ridge_penalty is None:
+            self.ridge_penalty = 1 / len(X)
+
+        # This is the paired BLPR algorithm
+        self._fit_paired_blpr(X, y)
+
+        return self
+
+    def predict(self, X):
+        return X @ self.coef_mle_ + self.intercept_mle_
+
+    def _get_glmnet_limits_from_domain(self) -> dict:
+        limits = {
+            'upper_limits': np.inf,
+            'lower_limits': -np.inf
+        }
+        if self.domain == 'pos':
+            limits['lower_limits'] = 0
+        if self.domain == 'neg':
+            limits['upper_limits'] = 0
+
+        return limits
+
+    @staticmethod
+    def _get_glmnet_lambda_path(lam):
+        return np.array([lam * 0.98, lam])
+
+    def _fit_paired_blpr(self, x, y):
+        warnings.simplefilter('ignore')
+        n, p = x.shape
+
+        m_trace, b_trace = [], []
+        progressor = trange(self.draws, desc='Bootstrap Iterations') if self.verbose else range(self.draws)
+        for b in progressor:
+            # 1. Create bootstrap samples of x -> x_boot & y -> y_boot
+            x_boot, y_boot = resample(x, y, replace=True, random_state=b)
+
+            # 2. Find the best λ
+            if self.best_lam_ is None:
+                best_lam_finder = ElasticNet(
+                    alpha=1,
+                    n_splits=self.cv,
+                    n_lambda=self.n_lams,
+                    min_lambda_ratio=self.eps,
+                    fit_intercept=self.fit_intercept,
+                    **self._get_glmnet_limits_from_domain()
+                )
+                best_lam_finder.fit(x, y)  # TODO (15-Mar-21) add weights later
+                self.best_lam_ = best_lam_finder.lambda_best_[0]
+                if self.verbose:
+                    print(f'Optimal λ => {self.best_lam_:.3f}')
+
+            boot_l1_model = ElasticNet(
+                alpha=1,
+                n_splits=self.cv,
+                lambda_path=self._get_glmnet_lambda_path(self.best_lam_),
+                fit_intercept=self.fit_intercept,
+                **self._get_glmnet_limits_from_domain()
+            )
+            boot_l1_model.fit(x_boot, y_boot)
+            m_boot_l1 = boot_l1_model.coef_
+
+            partial_ridge_selector = np.ones(p)
+            partial_ridge_selector[m_boot_l1.nonzero()] = 0
+
+            # 4. Solve m_boot_blpr
+            blpr = ElasticNet(
+                alpha=0,
+                n_splits=self.cv,
+                lambda_path=self._get_glmnet_lambda_path(self.ridge_penalty / 2),
+                fit_intercept=self.fit_intercept,
+                **self._get_glmnet_limits_from_domain()
+            )
+            blpr.fit(
+                x_boot, y_boot,
+                relative_penalties=partial_ridge_selector
+            )
+            m_trace.append(blpr.coef_)
+            b_trace.append(blpr.intercept_)
+        m_trace = np.vstack(m_trace)
+        b_trace = np.array(b_trace)
+        self.coef_trace_ = m_trace.copy()
+        self.intercept_trace_ = b_trace.copy()
+        self.coef_mle_ = self.coef_trace_.mean(axis=0)
+        self.intercept_mle_ = b_trace.mean(axis=0)
+        warnings.simplefilter('default')
 
 
 # noinspection PyPep8Naming
@@ -193,3 +334,63 @@ class BairSupervisedPCA(BaseEstimator, TransformerMixin):
         :return:
         """
         return self.conditioner_model_.predict(self.pca.transform(X[:, self.indices]))
+
+
+if __name__ == '__main__':
+    import matplotlib.pyplot as graph
+    from sklearn.linear_model import LassoCV
+    from sklearn.datasets import load_boston
+    from scipy import stats
+    graph.style.use('fivethirtyeight')
+
+    N, P = 300, 30
+    m_true = np.zeros(P)
+    m_true[:4] = [2, -2, 2, 3]
+
+    noise = 3 * stats.norm().rvs(N)
+
+    data = 3*stats.norm().rvs((N, P))
+    target = data @ m_true + noise
+
+    # OR!
+    # data, target = load_boston(return_X_y=True)
+    # N, P = data.shape
+    print(data)
+
+    lasso_cv = LassoCV(cv=10, positive=True).fit(data, target)
+    print(f'best λ = {lasso_cv.alpha_}')
+
+    print('=== SKLearn ===')
+    print(f'R2 = {lasso_cv.score(data, target):.2%}')
+    graph.plot(lasso_cv.coef_, alpha=0.6, label='SKLearn')
+
+    print('=== GLM Net ===')
+    warnings.simplefilter('ignore')
+    glmnet = ElasticNet(
+        alpha=1,  # 0 for ridge and 1 for lasso
+        # lambda_path=np.array([lasso_cv.alpha_ * 0.98, lasso_cv.alpha_]),  # Comment if you want the model to search
+        n_splits=10,
+        lower_limits=0
+    ).fit(data, target)
+    warnings.simplefilter('default')
+    print(f'R2 = {glmnet.score(data, target):.2%}')
+    graph.plot(glmnet.coef_, alpha=0.6, label='GLM Net')
+
+    print('=== Blooper ===')
+    # blooper = Blooper(best_lam=lasso_cv.alpha_, draws=100).fit(data, target)
+    blooper = Blooper(draws=100, domain='pos', verbose=True).fit(data, target)
+    print(f'R2 = {blooper.score(data, target):.2%}')
+    graph.plot(blooper.coef_mle_, alpha=0.6, label='BLPR')
+
+    graph.plot(m_true, '*', color='black', label='True')
+
+    graph.legend()
+    graph.ylabel(r'$\beta$')
+    graph.xlabel('Coefficient')
+    graph.show()
+
+    for b in trange(len(blooper.coef_trace_), desc='Plotting...'):
+        graph.plot(blooper.coef_trace_[b, :], color='black', lw=1, alpha=0.05)
+    graph.plot(m_true, '*', markersize=5, label='True')
+    graph.axhline(0, color='k', linestyle='--', linewidth=1)
+    graph.show()
