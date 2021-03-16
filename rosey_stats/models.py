@@ -1,6 +1,5 @@
 import warnings
 import numpy as np
-import numpy.linalg as la
 import pandas as pd
 from rich import print
 from tqdm import tqdm, trange
