@@ -80,7 +80,31 @@ class Blooper(BaseEstimator, RegressorMixin):
         return self
 
     def predict(self, X):
+        self._check_is_fitted()
         return X @ self.coef_mle_ + self.intercept_mle_
+
+    def predict_ppc(self, X, n_samples=None):
+        self._check_is_fitted()
+        if n_samples is None:
+            n_samples = range(len(self.coef_trace_))
+        else:
+            assert 0 < n_samples <= len(self.coef_trace_)
+            n_samples = np.random.choice(
+                np.arange(len(self.coef_trace_)),
+                n_samples,
+                replace=False
+            )
+
+        y_hats = []
+        for i in n_samples:
+            y_hats.append(X @ self.coef_trace_[i] + self.intercept_trace_[i])
+        y_hats = np.vstack(y_hats)
+        return y_hats
+
+    def _check_is_fitted(self):
+        if self.coef_mle_ is None:
+            from sklearn.exceptions import NotFittedError
+            raise NotFittedError
 
     def _get_glmnet_limits_from_domain(self) -> dict:
         limits = {
