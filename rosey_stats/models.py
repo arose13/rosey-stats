@@ -55,7 +55,7 @@ class Blooper(BaseEstimator, RegressorMixin):
         self.draws = draws
         self.cv = cv
         self.domain = domain
-        self.best_lam_ = best_lam
+        self.best_lam = best_lam
         self.ridge_penalty = ridge_penalty
         self.fit_intercept = fit_intercept
         self.verbose = verbose
@@ -133,7 +133,7 @@ class Blooper(BaseEstimator, RegressorMixin):
             x_boot, y_boot = resample(x, y, replace=True, random_state=b)
 
             # 2. Find the best λ
-            if self.best_lam_ is None:
+            if self.best_lam is None:
                 best_lam_finder = ElasticNet(
                     alpha=1,
                     n_splits=self.cv,
@@ -143,14 +143,14 @@ class Blooper(BaseEstimator, RegressorMixin):
                     **self._get_glmnet_limits_from_domain()
                 )
                 best_lam_finder.fit(x, y)  # TODO (15-Mar-21) add weights later
-                self.best_lam_ = best_lam_finder.lambda_best_[0]
+                self.best_lam = best_lam_finder.lambda_best_[0]
                 if self.verbose:
-                    print(f'Optimal λ => {self.best_lam_:.3f}')
+                    print(f'Optimal λ => {self.best_lam:.3f}')
 
             boot_l1_model = ElasticNet(
                 alpha=1,
                 n_splits=self.cv,
-                lambda_path=self._get_glmnet_lambda_path(self.best_lam_),
+                lambda_path=self._get_glmnet_lambda_path(self.best_lam),
                 fit_intercept=self.fit_intercept,
                 **self._get_glmnet_limits_from_domain()
             )
