@@ -1,7 +1,6 @@
 import warnings
 import numpy as np
 import pandas as pd
-from rich import print
 from tqdm import tqdm, trange
 from sklearn.utils import resample
 from sklearn.base import BaseEstimator, TransformerMixin, RegressorMixin
@@ -12,6 +11,10 @@ from sklearn.exceptions import NotFittedError
 from sklearn.model_selection import KFold
 from sklearn.metrics import mean_squared_error, log_loss
 from glmnet import ElasticNet
+try:
+    from rich import print
+except ImportError:
+    print('If you would like very pretty printing you can install the `rich` package')
 
 
 def vec_to_array(a: np.ndarray):
