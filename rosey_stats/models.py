@@ -25,7 +25,7 @@ def vec_to_array(a: np.ndarray):
 class Blooper(BaseEstimator, RegressorMixin):
     """
     Boostrap Lasso with Partial Ridge Regression
-    https://arxiv.org/pdf/1706.02150v1.pd
+    https://arxiv.org/pdf/1706.02150v1.pdf
     """
     def __init__(
             self,
@@ -129,11 +129,12 @@ class Blooper(BaseEstimator, RegressorMixin):
         warnings.simplefilter('ignore')
         n, p = x.shape
 
-        m_trace, b_trace = [], []
-        progressor = trange(self.draws, desc='Bootstrap Iterations') if self.verbose else range(self.draws)
-        for b in progressor:
+        m_trace, b_trace, i_boot = [], [], 0
+        progressor = tqdm(total=self.draws, desc='Bootstrap Iterations')
+        # for b in progressor:
+        while i_boot < self.draws:
             # 1. Create bootstrap samples of x -> x_boot & y -> y_boot
-            x_boot, y_boot = resample(x, y, replace=True, random_state=b)
+            x_boot, y_boot = resample(x, y, replace=True, random_state=i_boot)
 
             # 2. Find the best λ
             if self.best_lam is None:
@@ -171,19 +172,30 @@ class Blooper(BaseEstimator, RegressorMixin):
                 fit_intercept=self.fit_intercept,
                 **self._get_glmnet_limits_from_domain()
             )
-            blpr.fit(
-                x_boot, y_boot,
-                relative_penalties=partial_ridge_selector
-            )
-            m_trace.append(blpr.coef_)
-            b_trace.append(blpr.intercept_)
+            try:
+                blpr.fit(
+                    x_boot, y_boot,
+                    relative_penalties=partial_ridge_selector
+                )
+                m_trace.append(blpr.coef_)
+                b_trace.append(blpr.intercept_)
+                i_boot += 1
+                if self.verbose:
+                    progressor.update(i_boot)
+            except ValueError:
+                warnings.warn('BLPR failed, retrying')
+                continue
+
         m_trace = np.vstack(m_trace)
         b_trace = np.array(b_trace)
         self.coef_trace_ = m_trace.copy()
         self.intercept_trace_ = b_trace.copy()
         self.coef_mle_ = self.coef_trace_.mean(axis=0)
         self.intercept_mle_ = b_trace.mean(axis=0)
+
         warnings.simplefilter('default')
+        if self.verbose:
+            progressor.close()
 
 
 # noinspection PyPep8Naming
