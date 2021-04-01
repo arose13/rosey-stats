@@ -183,7 +183,9 @@ class Blooper(BaseEstimator, RegressorMixin):
                 if self.verbose:
                     progressor.update(i_boot)
             except ValueError:
+                warnings.simplefilter('default')
                 warnings.warn('BLPR failed, retrying')
+                warnings.simplefilter('ignore')
                 continue
 
         m_trace = np.vstack(m_trace)
