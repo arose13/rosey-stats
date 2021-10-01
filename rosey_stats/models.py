@@ -1,11 +1,13 @@
 import warnings
 import numpy as np
 import pandas as pd
+from copy import deepcopy
 from tqdm import tqdm, trange
 from sklearn.utils import resample
 from sklearn.base import BaseEstimator, TransformerMixin, RegressorMixin
 from sklearn.decomposition import PCA
-from sklearn.linear_model import LogisticRegression, LinearRegression
+from sklearn.linear_model import LogisticRegression, LinearRegression, LassoCV
+from sklearn.tree import DecisionTreeRegressor
 from sklearn.feature_selection import f_regression, f_classif
 from sklearn.exceptions import NotFittedError
 from sklearn.model_selection import KFold
@@ -129,12 +131,12 @@ class Blooper(BaseEstimator, RegressorMixin):
         warnings.simplefilter('ignore')
         n, p = x.shape
 
-        m_trace, b_trace, i_boot = [], [], 0
+        m_trace, b_trace, i_boot, i_failed_run = [], [], 0, 0
         progressor = tqdm(total=self.draws, desc='Bootstrap Iterations')
         # for b in progressor:
         while i_boot < self.draws:
             # 1. Create bootstrap samples of x -> x_boot & y -> y_boot
-            x_boot, y_boot = resample(x, y, replace=True, random_state=i_boot)
+            x_boot, y_boot = resample(x, y, replace=True, random_state=i_boot + i_failed_run)
 
             # 2. Find the best λ
             if self.best_lam is None:
@@ -183,6 +185,7 @@ class Blooper(BaseEstimator, RegressorMixin):
                 if self.verbose:
                     progressor.update(i_boot)
             except ValueError:
+                i_failed_run += 1
                 warnings.simplefilter('default')
                 warnings.warn('BLPR failed, retrying')
                 warnings.simplefilter('ignore')
@@ -376,61 +379,73 @@ class BairSupervisedPCA(BaseEstimator, TransformerMixin):
         return self.conditioner_model_.predict(self.pca.transform(X[:, self.indices]))
 
 
-if __name__ == '__main__':
-    import matplotlib.pyplot as graph
-    from sklearn.linear_model import LassoCV
-    from sklearn.datasets import load_boston
-    from scipy import stats
-    graph.style.use('fivethirtyeight')
+# noinspection PyPep8Naming
+class M5TreeRegressor(BaseEstimator, RegressorMixin):
+    def __init__(
+            self,
+            min_samples_leaf: int or str = 'auto',
+            linear_estimator=LassoCV(cv=3),
+            decision_tree_kwargs=None,
+            verbose=False
+    ):
+        if decision_tree_kwargs is not None:
+            assert 'min_samples_leaf' not in decision_tree_kwargs.keys()
+            assert 'max_features' not in decision_tree_kwargs.keys()
 
-    N, P = 300, 30
-    m_true = np.zeros(P)
-    m_true[:4] = [2, -2, 2, 3]
+        self.min_samples_leaf = min_samples_leaf
+        self.linear_estimator = linear_estimator
+        self.decision_tree_kwargs = decision_tree_kwargs if isinstance(decision_tree_kwargs, dict) else {}
+        self.verbose = verbose
 
-    noise = 3 * stats.norm().rvs(N)
+        self._tree = None  # type: DecisionTreeRegressor
+        self._linear_models = {}  # type: dict
 
-    data = 3*stats.norm().rvs((N, P))
-    target = data @ m_true + noise
+    def fit(self, X: np.ndarray, y: np.ndarray, sample_weight=None):
+        n, p = X.shape
+        estimated_min_samples_leaf = p*10 if self.min_samples_leaf == 'auto' else self.min_samples_leaf
+        if n <= estimated_min_samples_leaf:
+            warnings.warn(f'Small dataset! N={n:,} min samples per leaf = {estimated_min_samples_leaf:,}')
 
-    # OR!
-    # data, target = load_boston(return_X_y=True)
-    # N, P = data.shape
-    print(data)
+        # Fit underlying tree
+        if self.verbose:
+            print('Fitting Tree...', flush=True)
+        self._tree = DecisionTreeRegressor(
+            min_samples_leaf=estimated_min_samples_leaf,
+            max_features='auto',
+            **self.decision_tree_kwargs
+        )
+        self._tree.fit(X, y, sample_weight)
+        sample_leaf_id = self._tree.apply(X)
+        unique_leaves = np.unique(sample_leaf_id)
 
-    lasso_cv = LassoCV(cv=10, positive=True).fit(data, target)
-    print(f'best λ = {lasso_cv.alpha_}')
+        # Fit linear models
+        progressor = tqdm(unique_leaves, desc='Fitting Linear Models...') if self.verbose else unique_leaves
+        for leaf_id in progressor:
+            selector = sample_leaf_id == leaf_id
+            model = deepcopy(self.linear_estimator)
+            self._linear_models[leaf_id] = model.fit(X[selector, :], y[selector])
 
-    print('=== SKLearn ===')
-    print(f'R2 = {lasso_cv.score(data, target):.2%}')
-    graph.plot(lasso_cv.coef_, alpha=0.6, label='SKLearn')
+        if self.verbose:
+            print('Done!')
 
-    print('=== GLM Net ===')
-    warnings.simplefilter('ignore')
-    glmnet = ElasticNet(
-        alpha=1,  # 0 for ridge and 1 for lasso
-        # lambda_path=np.array([lasso_cv.alpha_ * 0.98, lasso_cv.alpha_]),  # Comment if you want the model to search
-        n_splits=10,
-        lower_limits=0
-    ).fit(data, target)
-    warnings.simplefilter('default')
-    print(f'R2 = {glmnet.score(data, target):.2%}')
-    graph.plot(glmnet.coef_, alpha=0.6, label='GLM Net')
+    def predict(self, X, verbose=False):
+        self._check_is_fitted()
 
-    print('=== Blooper ===')
-    # blooper = Blooper(best_lam=lasso_cv.alpha_, draws=100).fit(data, target)
-    blooper = Blooper(draws=100, domain='pos', verbose=True).fit(data, target)
-    print(f'R2 = {blooper.score(data, target):.2%}')
-    graph.plot(blooper.coef_mle_, alpha=0.6, label='BLPR')
+        y_hat = np.zeros(len(X))
+        sample_leaf_id = self._tree.apply(X)
+        progressor = tqdm(np.unique(sample_leaf_id)) if verbose else np.unique(sample_leaf_id)
+        for leaf_id in progressor:
+            selector = sample_leaf_id == leaf_id
+            y_hat[selector] = self._linear_models[leaf_id].predict(X[selector, :])
 
-    graph.plot(m_true, '*', color='black', label='True')
+        return y_hat
 
-    graph.legend()
-    graph.ylabel(r'$\beta$')
-    graph.xlabel('Coefficient')
-    graph.show()
+    def score(self, X, y, sample_weight=None):
+        from sklearn.metrics import r2_score
+        self._check_is_fitted()
 
-    for b in trange(len(blooper.coef_trace_), desc='Plotting...'):
-        graph.plot(blooper.coef_trace_[b, :], color='black', lw=1, alpha=0.05)
-    graph.plot(m_true, '*', markersize=5, label='True')
-    graph.axhline(0, color='k', linestyle='--', linewidth=1)
-    graph.show()
+        return r2_score(y, self.predict(X))
+
+    def _check_is_fitted(self):
+        if self._tree is None:
+            raise NotFittedError
